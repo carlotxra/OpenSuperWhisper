@@ -33,6 +33,10 @@ class IndicatorViewModel: ObservableObject {
     @Published var isConfirmingCancel = false
     @Published var recorder: AudioRecorder = .shared
     @Published var isVisible = false
+    /// The physical notch of the screen this bubble is showing on, nil when that screen has
+    /// none. Set at record-start by the window manager, which is the only place that knows
+    /// which screen was chosen: a laptop plugged into an external display has one of each.
+    @Published var physicalNotch: CGSize?
 
     var recordingStartedAt: Date?
     /// Set by the trigger when this take should be submitted after insertion (#50). Carried
@@ -439,7 +443,11 @@ struct IndicatorWindow: View {
     /// Padding and minimum sizes follow the text setting, or the bubble keeps its shipped size
     /// however large the text is set. Notch mode is excluded: its geometry is the hardware's.
     @Environment(\.textScaleFactor) private var scale
-    
+    /// How far the opening has travelled past the notch band, 0 to 1. Drives the mask only, never
+    /// layout, which is why it is a plain value animated from outside the mask rather than an
+    /// animation attached inside it.
+    @State private var apronProgress: CGFloat = 0
+
     private var backgroundColor: Color {
         colorScheme == .dark
             ? Color.black.opacity(0.24)
@@ -538,7 +546,29 @@ struct IndicatorWindow: View {
         }
     }
 
+    /// The measurements of the screen's cutout, or nil when it has none.
+    ///
+    /// Everything hardware-shaped hangs off this one optional. A screen without a notch never
+    /// gets a value, so it never takes the branch below and keeps the drawn-on pill it has
+    /// always had: measurements from one Mac have no business shaping the look on another.
+    private var notchGeometry: NotchGeometry? {
+        guard isNotchMode else { return nil }
+        return NotchGeometry.measure(cutout: viewModel.physicalNotch,
+                                     layout: layout,
+                                     textScale: CGFloat(scale),
+                                     topRadius: CGFloat(notch.topRadius),
+                                     bottomRadius: CGFloat(notch.bottomRadius))
+    }
+
     var body: some View {
+        if let geometry = notchGeometry {
+            notchBubble(geometry)
+        } else {
+            classicBubble
+        }
+    }
+
+    @ViewBuilder private var classicBubble: some View {
 
         // Notch mode uses the real notch silhouette (concave top wings + rounded bottom).
         let rect: AnyShape = isNotchMode
@@ -731,6 +761,248 @@ struct IndicatorWindow: View {
         }
         .onAppear {
             viewModel.isVisible = true
+        }
+    }
+
+    // MARK: - Around a real notch
+
+    /// The bubble on a Mac that has a cutout: one width, whatever it is showing, and a height
+    /// that grows only when there is something the notch cannot hold.
+    ///
+    /// The small fixed elements go either side of the hardware, which is where the menu bar has
+    /// room to spare. Prose goes underneath, because a sentence laid out astride a hole loses its
+    /// middle. Nothing here is narrower than the notch: the width has a floor that accounts for
+    /// the silhouette's inward-curving wings, so the black always reaches past the glass.
+    private func notchBubble(_ geometry: NotchGeometry) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                notchFlank(geometry: geometry, alignment: .trailing) {
+                    notchLeadingContent(geometry)
+                }
+                // The hardware itself. Reserved on both sides even when only one of them has
+                // anything in it, or the hole slides off the notch by half the missing width.
+                Color.clear
+                    .frame(width: geometry.cutout.width, height: geometry.bandHeight)
+                notchFlank(geometry: geometry, alignment: .leading) {
+                    notchElements(notchTrailingElements, geometry: geometry)
+                }
+            }
+            .frame(height: geometry.bandHeight)
+
+            if hasNotchApron {
+                notchApron
+                    .padding(.horizontal, 18)
+                    .padding(.top, 5)
+                    .padding(.bottom, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(width: geometry.width)
+        .background { notchSilhouette(geometry).fill(.black) }
+        .environment(\.colorScheme, .dark)
+        // Measured here, before the mask, which is render-only. Nothing about the entrance may
+        // reach this: the manager resizes the window from it, and a size that animates would
+        // feed a stream of window resizes back into layout (the macOS 26 recursion, #19).
+        .overlay(
+            GeometryReader { proxy in
+                Color.clear.preference(key: IndicatorContentSizeKey.self, value: proxy.size)
+            }
+            .allowsHitTesting(false)
+        )
+        // The opening the bubble is seen through. A mask rather than a transform, so the bubble
+        // is uncovered at its final size instead of being squashed into the notch and stretched
+        // back out. It carries the entrance and every later change of height: the window snaps,
+        // deliberately, and the mask is what makes that read as the pill growing.
+        .mask {
+            // The height is read here rather than measured a frame earlier, so the opening is
+            // always the bubble's real height and can never clip what the bubble is saying. An
+            // earlier version drove it from the size reported for the window, which arrives late,
+            // and the message was invisible until it caught up.
+            //
+            // There is deliberately no `.animation` inside here. Any animation modifier in this
+            // GeometryReader leaks into layout, whatever value drives it, and then the bubble
+            // itself grows over 40 frames inside a window that snapped to full height in one.
+            // SwiftUI centres content smaller than its frame, so the pill appeared to swell out
+            // of the middle of the notch in both directions at once, with a gap showing the
+            // desktop through the middle. The animation lives in `apronProgress` instead, set
+            // from `.onChange` below, which runs after layout has already settled.
+            GeometryReader { proxy in
+                NotchReveal(width: viewModel.isVisible ? geometry.width : geometry.cutout.width,
+                            height: openHeight(geometry, full: proxy.size.height),
+                            topRadius: geometry.topRadius,
+                            bottomRadius: geometry.bottomRadius)
+            }
+        }
+        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: viewModel.isVisible)
+        .onPreferenceChange(IndicatorContentSizeKey.self) { size in
+            onContentResize(size)
+        }
+        // Set here rather than inside the mask so the bubble's own layout has already settled,
+        // unanimated, by the time this runs. That ordering is the whole trick: the height snaps,
+        // and only the opening over it travels.
+        .onChange(of: hasNotchApron) { _, showing in
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.9)) {
+                apronProgress = showing ? 1 : 0
+            }
+        }
+        .onAppear {
+            viewModel.isVisible = true
+            if hasNotchApron { apronProgress = 1 }
+        }
+    }
+
+    /// How far down the opening reaches.
+    ///
+    /// Closed it is the cutout, so the first frame is indistinguishable from the hardware. Open it
+    /// is the band alone when nothing hangs below, and the bubble's whole measured height when
+    /// something does.
+    private func openHeight(_ geometry: NotchGeometry, full: CGFloat) -> CGFloat {
+        guard viewModel.isVisible else { return geometry.cutout.height }
+        return geometry.openHeight(progress: apronProgress, full: full)
+    }
+
+    /// A symbol and its message on one line, the symbol centred on the first line of text so a
+    /// message that wraps still reads as one block rather than as a symbol with a paragraph
+    /// hanging off it.
+    private func messageLine(_ symbol: (name: String, color: Color)?, _ text: Text) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            if let symbol {
+                Image(systemName: symbol.name)
+                    .scaledFont(size: 13, weight: .semibold)
+                    .foregroundColor(symbol.color)
+            }
+            text
+                .scaledFont(size: 13, weight: .semibold)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func notchSilhouette(_ geometry: NotchGeometry) -> NotchShape {
+        NotchShape(topRadius: geometry.topRadius, bottomRadius: geometry.bottomRadius)
+    }
+
+    /// One side of the cutout, at the fixed width both sides share.
+    ///
+    /// Content hugs the hardware, so the bubble reads as one object wrapped around the notch
+    /// rather than two islands adrift at the far edges. The slack goes to the outer edges, in
+    /// equal parts, which is what keeps the hole over the glass.
+    private func notchFlank<Content: View>(geometry: NotchGeometry, alignment: Alignment,
+                                          @ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(alignment == .trailing ? .trailing : .leading, NotchGeometry.innerGutter)
+            .frame(width: geometry.sideWidth, height: geometry.bandHeight, alignment: alignment)
+    }
+
+    private func notchElements(_ elements: [IndicatorElement],
+                               geometry: NotchGeometry) -> some View {
+        HStack(spacing: NotchGeometry.elementSpacing) {
+            ForEach(elements) { element in
+                IndicatorElementView(element: element,
+                                     bands: spectrum.bands,
+                                     meterHeight: notchMeterHeight(geometry),
+                                     isBlinking: viewModel.isBlinking,
+                                     isLatched: viewModel.isLatched,
+                                     queued: pipeline.pendingCount,
+                                     isDecoding: viewModel.state == .decoding)
+            }
+        }
+    }
+
+    /// What sits beside the notch, whatever the bubble is doing.
+    ///
+    /// Every state puts something here, and that is the point. The bubble is one object that
+    /// stays up from the moment you start speaking until the moment it goes away, so the band
+    /// beside the hardware must never go empty: a message used to clear both flanks, and since
+    /// the band itself is hidden behind the notch, the bubble read as having closed and then
+    /// reopened underneath. The words go below; what is happening stays up here.
+    @ViewBuilder private func notchLeadingContent(_ geometry: NotchGeometry) -> some View {
+        switch viewModel.state {
+        case .connecting:
+            ProgressView()
+                .progressViewStyle(.circular)
+                .controlSize(.small)
+        case .idle:
+            EmptyView()
+        default:
+            // `decodingLeading` rather than `leading` because it is the one that is never empty:
+            // a layout with neither meter nor label borrows the meter, and an empty flank means
+            // an invisible bubble. While a message is up the meter is simply at rest, which is
+            // both true and continuous with what was there a moment earlier.
+            notchElements(layout.decodingLeading, geometry: geometry)
+        }
+    }
+
+    /// The symbol that goes beside a message, or nil for a state that has no words.
+    private var notchMessageSymbol: (name: String, color: Color)? {
+        switch viewModel.state {
+        case .busy: return ("hourglass", .orange)
+        case .error: return ("exclamationmark.triangle.fill", .red)
+        case .info: return ("info.circle", .white)
+        case .connecting, .recording, .decoding, .idle: return nil
+        }
+    }
+
+    /// The meter is the tallest thing on the row and the row is the height of the cutout, so a
+    /// taller setting would stand the bars out from under the hardware instead of inside it.
+    private func notchMeterHeight(_ geometry: NotchGeometry) -> CGFloat {
+        min(meterHeight, geometry.bandHeight - 10)
+    }
+
+    private var notchTrailingElements: [IndicatorElement] {
+        switch viewModel.state {
+        case .recording, .decoding: return layout.trailing
+        case .idle, .connecting, .busy, .error, .info: return []
+        }
+    }
+
+    /// Whether anything hangs below the hardware. When nothing does, the bubble is exactly the
+    /// cutout's height and the only thing on screen is what flanks it.
+    private var hasNotchApron: Bool {
+        switch viewModel.state {
+        case .recording:
+            return viewModel.isConfirmingCancel
+                || !streaming.confirmedText.isEmpty
+                || !streaming.volatileText.isEmpty
+        case .connecting, .busy, .error, .info:
+            return true
+        case .idle, .decoding:
+            return false
+        }
+    }
+
+    /// Everything made of words. It keeps the width the bubble already had and takes the height
+    /// it needs, which is the one direction there is room to grow in.
+    @ViewBuilder private var notchApron: some View {
+        switch viewModel.state {
+        case .recording:
+            if viewModel.isConfirmingCancel {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Press Esc to cancel")
+                        .scaledFont(size: 12, weight: .semibold)
+                        .foregroundColor(.orange)
+                        .lineLimit(1)
+                    CancelConfirmationBar()
+                }
+            } else {
+                (Text(streaming.confirmedText).foregroundColor(.primary)
+                    + Text(streaming.confirmedText.isEmpty ? "" : " ")
+                    + Text(streaming.volatileText).foregroundColor(.secondary))
+                    .scaledFont(size: 13)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        // The symbol sits on the same line as the words it belongs to, not up in the band. Up
+        // there it read as an orphan on a line of its own, with the message stranded below it.
+        case .connecting:
+            messageLine(nil, Text("Connecting...").foregroundColor(.primary))
+        case .busy:
+            messageLine(notchMessageSymbol, Text("Processing...").foregroundColor(.orange))
+        case .error(let message):
+            messageLine(notchMessageSymbol, Text(message).foregroundColor(.red))
+        case .info(let message):
+            messageLine(notchMessageSymbol, Text(message).foregroundColor(.primary))
+        case .idle, .decoding:
+            EmptyView()
         }
     }
 }

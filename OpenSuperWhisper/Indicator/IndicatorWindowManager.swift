@@ -41,7 +41,15 @@ class IndicatorWindowManager: IndicatorViewDelegate {
         let newViewModel = IndicatorViewModel()
         newViewModel.delegate = self
         viewModel = newViewModel
-        
+
+        // Measured per show, and measured *first*. The bubble follows the caret, so which screen
+        // it lands on changes and only one of them may have hardware in the way. It has to be on
+        // the view model before the view is built: the first layout pass decides the shape the
+        // entrance animates out of, and a pass that ran before the measurement arrived armed the
+        // wrong one, which is what made the bubble visibly rise before settling.
+        let targetScreen = point.flatMap { FocusUtils.screenContaining(point: $0) } ?? NSScreen.main
+        newViewModel.physicalNotch = targetScreen.flatMap { NotchMetrics.physicalNotch(for: $0) }
+
         if window == nil {
             // Create window if it doesn't exist - using NSPanel for full-screen compatibility
             let panel = NSPanel(
@@ -94,7 +102,13 @@ class IndicatorWindowManager: IndicatorViewDelegate {
         // never appears in ANY position mode (#indicator-invisible). Seed a non-zero canvas
         // (non-animated, so no NSHostingView recursion-crash risk) so SwiftUI can lay out and
         // size the window.
-        window?.setContentSize(NSSize(width: 380, height: 120))
+        //
+        // Around a real notch that canvas is the finished size rather than a placeholder. The
+        // placeholder was 380×120 against a bubble 38pt tall, and NSHostingView centres a smaller
+        // content in its window: the pill was drawn a good 40pt below a window pinned to the top
+        // of the screen, then jumped up when the measured size came back. That is the climb the
+        // entrance was blamed for.
+        window?.setContentSize(seedSize(for: newViewModel.physicalNotch))
 
         // Accept clicks only when an on-bubble button is enabled (so it's tappable);
         // otherwise stay fully click-through (baseline). Re-evaluated each show() so
@@ -104,8 +118,6 @@ class IndicatorWindowManager: IndicatorViewDelegate {
             showsStop: AppPreferences.shared.showStopButtonOnIndicator,
             showsCancel: AppPreferences.shared.showCancelButtonOnIndicator)
 
-        // Position window - use the screen containing the point, or main screen as fallback
-        let targetScreen = point.flatMap { FocusUtils.screenContaining(point: $0) } ?? NSScreen.main
         if let window = window, let screen = targetScreen {
             let screenFrame = screen.frame
 
@@ -167,6 +179,25 @@ class IndicatorWindowManager: IndicatorViewDelegate {
 
         window?.orderFront(nil)
         return newViewModel
+    }
+
+    /// The canvas the window starts on, before SwiftUI has measured anything.
+    ///
+    /// Around a real notch this is the answer, not a guess: `NotchGeometry` is the single place
+    /// the width is worked out, and the view builds its bubble from the very same call. Anywhere
+    /// else it stays a roomy placeholder, since the size there depends on text nobody has laid
+    /// out yet and `resizeToContent` settles it a frame later.
+    private func seedSize(for cutout: CGSize?) -> NSSize {
+        guard AppPreferences.shared.indicatorPosition == "notch",
+              let geometry = NotchGeometry.measure(
+                cutout: cutout,
+                layout: IndicatorLayout.load(from: AppPreferences.shared.indicatorLayout),
+                textScale: CGFloat(TextScale.clamped(AppPreferences.shared.textScale)),
+                topRadius: CGFloat(NotchTuning.shared.topRadius),
+                bottomRadius: CGFloat(NotchTuning.shared.bottomRadius))
+        else { return NSSize(width: 380, height: 120) }
+
+        return NSSize(width: geometry.width, height: geometry.bandHeight)
     }
 
     /// Sizes the indicator window to its SwiftUI content, *non-animated*. This replaces
@@ -260,14 +291,41 @@ class IndicatorWindowManager: IndicatorViewDelegate {
     /// progress so it never interrupts the live recording bubble. The message auto-hides via the
     /// view model's own timer (showError/showInfo). (parallel-recording #3)
     func flash(_ state: RecordingState) {
-        if let current = viewModel, current.state == .recording || current.state == .connecting {
+        if let current = viewModel {
+            guard Self.messageMayTakeOver(from: current.state) else { return }
+
+            // Reuse the bubble that is already on screen. Going through `show()` built a fresh
+            // view and swapped it into the window, so between "transcribing" and whatever the
+            // clip turned out to be the pill visibly closed back into the notch and reopened.
+            // Nothing about the window has to change here: the message is one more thing to
+            // show in the bubble that is still up.
+            drainObserver?.cancel()
+            drainObserver = nil
+            present(state, on: current)
             return
         }
-        let vm = show(nearPoint: FocusUtils.getCurrentCursorPosition())
+        present(state, on: show(nearPoint: FocusUtils.getCurrentCursorPosition()))
+    }
+
+    /// Whether a message from the background pipeline may take over the bubble currently
+    /// showing `state`.
+    ///
+    /// Everything except a take in progress. The bubble is one object on screen, and building a
+    /// second one to say "no speech" made the pill close back into the notch and reopen between
+    /// transcribing and the answer. A live recording is the exception: the message belongs to an
+    /// earlier clip, and what is in front of the user is the take they are in the middle of.
+    nonisolated static func messageMayTakeOver(from state: RecordingState) -> Bool {
         switch state {
-        case .error(let message): vm.showError(message)
-        case .info(let message): vm.showInfo(message)
-        default: vm.showBusyMessage()
+        case .recording, .connecting: return false
+        case .idle, .decoding, .busy, .error, .info: return true
+        }
+    }
+
+    private func present(_ state: RecordingState, on viewModel: IndicatorViewModel) {
+        switch state {
+        case .error(let message): viewModel.showError(message)
+        case .info(let message): viewModel.showInfo(message)
+        default: viewModel.showBusyMessage()
         }
     }
 
