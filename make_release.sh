@@ -98,7 +98,14 @@ fi
 chmod +x ./notarize_app.sh
 # No exit-code check here: `set -e` already aborts on a non-zero return, so a test on $? would
 # only ever see the 0 of a script that succeeded.
-./notarize_app.sh "${CODE_SIGN_IDENTITY}"
+# ARCH has to be passed positionally. `notarize_app.sh` reads it as `${2:-arm64}`, so leaving it
+# off does not inherit it from the environment, it silently builds arm64 — and then also skips
+# the two things that run only for x86_64 in there: stripping the arm64-only onnxruntime, and
+# pointing Sparkle at the x86_64 appcast. An Intel release built this way is an ARM binary under
+# an Intel name, subscribed to the wrong update feed. The DMG filename carries the architecture,
+# so the run dies looking for a file that was never made, which is the only reason this was a
+# failed release rather than a wrong one.
+./notarize_app.sh "${CODE_SIGN_IDENTITY}" "${ARCH}"
 
 echo "✅ Build and notarization successful!"
 
@@ -114,15 +121,24 @@ fi
 DSYM_PATH="./build/Build/Products/Release/OpenSuperWhisper.app.dSYM"
 # Named per architecture: the two slices have different symbols, and uploading both under one
 # name left whichever lost the race with none to read a crash report against.
-DSYM_ZIP_PATH="./OpenSuperWhisper-${ARCH}-${NEW_VERSION}.app.dSYM.zip"
+#
+# Absolute, because the zip is made from inside the build directory. Relative, the `mv` that
+# was meant to bring it back to the repo root renamed it onto itself and left it in the build
+# directory, so the `-f` test below found nothing and the upload was skipped without a word.
+# No release has ever carried a dSYM: not 0.12.2, not 0.12.1, not 0.12.0. Which means every
+# crash report we have been sent had no symbols to read it against.
+DSYM_ZIP_PATH="$(pwd)/OpenSuperWhisper-${ARCH}-${NEW_VERSION}.app.dSYM.zip"
 
 if [[ -d "$DSYM_PATH" ]]; then
     echo "📦 Creating dSYM zip..."
-    cd $(dirname "$DSYM_PATH")
-    zip -r "$(basename "$DSYM_ZIP_PATH")" "$(basename "$DSYM_PATH")" > /dev/null
-    mv "$(basename "$DSYM_ZIP_PATH")" "$DSYM_ZIP_PATH"
-    cd - > /dev/null
-    echo "✅ dSYM zip created: $DSYM_ZIP_PATH"
+    rm -f "$DSYM_ZIP_PATH"
+    # A subshell, so a failure here cannot leave the rest of the script in the build directory.
+    (cd "$(dirname "$DSYM_PATH")" && zip -r -q "$DSYM_ZIP_PATH" "$(basename "$DSYM_PATH")")
+    if [[ ! -f "$DSYM_ZIP_PATH" ]]; then
+        echo "❌ dSYM zip was not written to $DSYM_ZIP_PATH"
+        exit 1
+    fi
+    echo "✅ dSYM zip created: $DSYM_ZIP_PATH ($(du -h "$DSYM_ZIP_PATH" | cut -f1))"
 else
     echo "⚠️ dSYM not found at $DSYM_PATH - skipping dSYM upload"
     DSYM_ZIP_PATH=""
@@ -154,11 +170,16 @@ fi
 if [[ -n "$GITHUB_TOKEN" ]]; then
     # The second architecture joins the release the first one made. A tag carries one release,
     # so creating it again just fails.
+    # `|| true` is load-bearing. On the FIRST architecture there is no release yet, the lookup
+    # 404s, `grep` matches nothing and exits 1, and under `set -e` an assignment from a failing
+    # command substitution aborts the script — right after the tag has been pushed and forty
+    # minutes of notarisation have completed. Finding nothing here is the normal case, not an
+    # error.
     RELEASE_ID=$(curl -s -L \
         -H "Accept: application/vnd.github+json" \
         -H "Authorization: Bearer ${GITHUB_TOKEN}" \
         "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" \
-        | grep -o '"id": [0-9]*' | head -1 | grep -o '[0-9]*')
+        | grep -o '"id": [0-9]*' | head -1 | grep -o '[0-9]*' || true)
 
     if [[ -n "$RELEASE_ID" ]]; then
         echo "🚀 Release ${TAG} exists (ID: $RELEASE_ID), adding the ${ARCH} build."
@@ -182,7 +203,10 @@ if [[ -n "$GITHUB_TOKEN" ]]; then
             }')
     
         # Extract release ID from response
-        RELEASE_ID=$(echo "$RELEASE_RESPONSE" | grep -o '"id": [0-9]*' | head -1 | grep -o '[0-9]*')
+        # Same reason: a creation that failed has no id to find, and the explicit check just
+        # below is what should report that, with the response body, rather than `set -e`
+        # killing the run one line earlier and saying nothing.
+        RELEASE_ID=$(echo "$RELEASE_RESPONSE" | grep -o '"id": [0-9]*' | head -1 | grep -o '[0-9]*' || true)
     
         if [[ -z "$RELEASE_ID" ]]; then
             echo "❌ Failed to create GitHub release or extract release ID"
