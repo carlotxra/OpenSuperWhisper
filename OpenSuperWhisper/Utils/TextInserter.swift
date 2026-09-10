@@ -29,14 +29,33 @@ enum TextInserter {
         return result
     }
 
-    /// Pause between chunks, so the receiving app gets a chance to process each one.
+    /// Default pause between chunks, so the receiving app gets a chance to process each one.
     ///
     /// Unpaced, a 400-character dictation is ~40 key events posted inside a millisecond. An app
     /// that re-renders its whole input area per keystroke falls behind, and its buffer and caret
     /// drift apart: reported as existing text duplicated two or three times with the new speech
     /// wedged inside, in a terminal TUI, and it got likelier the fuller the input box already was
     /// (#85). Paste mode was unaffected, which is one event instead of forty.
-    static let chunkPauseMicroseconds: useconds_t = 2_000
+    ///
+    /// Two milliseconds is not enough for the app that produced the report, and the reason is that
+    /// the cost this has to cover is the target's redraw, which scales with what the box already
+    /// holds rather than with what we are sending. A short dictation into a long message therefore
+    /// gets the least pacing exactly where it needs the most, and no single constant fixes that.
+    /// Measured there at 10ms of total pacing into a 400-character box, still corrupt. So this is
+    /// a default that can be raised, globally and per app, rather than the answer.
+    static let defaultChunkPauseMilliseconds = 2
+
+    /// Anything above this is almost certainly a mistake rather than a preference: at 50ms a
+    /// 400-character dictation would take two seconds of blocked main thread.
+    static let maxChunkPauseMilliseconds = 50
+
+    static var chunkPauseMicroseconds: useconds_t {
+        microseconds(fromMilliseconds: AppPreferences.shared.typingPaceMilliseconds)
+    }
+
+    static func microseconds(fromMilliseconds milliseconds: Int) -> useconds_t {
+        useconds_t(min(max(milliseconds, 0), maxChunkPauseMilliseconds)) * 1_000
+    }
 
     /// Ceiling on the delay this adds in total. Typing runs on the main thread, and it has to:
     /// the caller presses Return after it returns, so going async would race the submit key
@@ -44,11 +63,12 @@ enum TextInserter {
     /// than freezing the app.
     static let maxTotalPauseMicroseconds: useconds_t = 500_000
 
-    /// How long to wait between chunks for a text of `chunkCount` chunks.
-    static func chunkPause(forChunkCount chunkCount: Int) -> useconds_t {
-        guard chunkCount > 1 else { return 0 }
+    /// How long to wait between chunks for a text of `chunkCount` chunks, given a requested pace.
+    static func chunkPause(forChunkCount chunkCount: Int,
+                           requested: useconds_t = TextInserter.chunkPauseMicroseconds) -> useconds_t {
+        guard chunkCount > 1, requested > 0 else { return 0 }
         let gaps = useconds_t(chunkCount - 1)
-        return min(chunkPauseMicroseconds, maxTotalPauseMicroseconds / gaps)
+        return min(requested, maxTotalPauseMicroseconds / gaps)
     }
 
     /// Types `text` into the focused app as Unicode keyboard events. Each chunk
@@ -65,23 +85,51 @@ enum TextInserter {
     /// `targetLength` nil is itself a finding rather than a gap: an app that will not say how much
     /// it is holding is an app where pacing derived from that number cannot work, and the report
     /// came from an Electron terminal.
-    static func insertionLogLine(app: String, targetLength: Int?, caret: Int?,
+    /// - Parameters:
+    ///   - app: the app actually receiving the events, read now.
+    ///   - dictatedInto: the app the clip was recorded in, which is what the per-app rule was
+    ///     resolved from. The two differ whenever the user switches apps while transcription
+    ///     runs, and their disagreement is itself worth seeing: the pace on this line came from
+    ///     the second, so a line that named only the first would attribute one app's rule to
+    ///     another and send triage into the settings code.
+    ///   - rule: what the rule lookup decided, so a rule that matched can be told apart from one
+    ///     that silently did not. A typo in a bundle identifier and no rule at all otherwise
+    ///     produce the same line, and that is the first question anyone reading #85 now asks.
+    static func insertionLogLine(app: String, dictatedInto: String?, rule: String,
+                                 mechanism: String, targetLength: Int?, caret: Int?,
                                  payload: Int, chunks: Int, pause: useconds_t) -> String {
         let gaps = max(chunks - 1, 0)
         let target = targetLength.map(String.init) ?? "unavailable"
         let caretText = caret.map(String.init) ?? "unavailable"
-        return "insert app=\(app) target=\(target) caret=\(caretText) payload=\(payload) "
+        return "insert via=\(mechanism) app=\(app) dictated-into=\(dictatedInto ?? "unknown") "
+            + "rule=\(rule) target=\(target) caret=\(caretText) payload=\(payload) "
             + "chunks=\(chunks) pause=\(pause)us/gap total=\(UInt(pause) * UInt(gaps))us"
+    }
+
+    /// How a rule reads on the diagnostic line.
+    static func ruleDescription(_ rule: AppInsertionRule?) -> String {
+        guard let rule else { return "none" }
+        guard rule.mode == .type, let pace = rule.typingPaceMilliseconds else {
+            return rule.mode.rawValue
+        }
+        return "\(rule.mode.rawValue)@\(pace)ms"
     }
 
     /// Reads the target's state and logs the line. Skipped entirely when diagnostics are off: the
     /// accessibility read costs up to 32ms, and the insertion path should not pay that to log
     /// nothing.
-    private static func logInsertion(payload: String, chunks: Int, pause: useconds_t) {
+    /// Called by `TranscriptInserter`, which is where the rule and the recorded app are known.
+    /// Logging from inside `type()` could only see the app in front right now, which is not the
+    /// one the decision was made for.
+    static func logInsertion(payload: String, mechanism: String, dictatedInto: String?,
+                             rule: AppInsertionRule?, chunks: Int, pause: useconds_t) {
         guard Diag.isEnabled else { return }
         let metrics = FocusUtils.focusedTextMetrics()
         Diag.mark(insertionLogLine(
             app: NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown",
+            dictatedInto: dictatedInto,
+            rule: ruleDescription(rule),
+            mechanism: mechanism,
             targetLength: metrics?.length,
             caret: metrics?.caret,
             payload: payload.count,
@@ -89,12 +137,15 @@ enum TextInserter {
             pause: pause))
     }
 
-    static func type(_ text: String) {
+    /// - Parameter paceMilliseconds: gap between chunks. Defaults to the global setting; a
+    ///   per-app rule passes its own, because the app being dictated into is what decides how
+    ///   much pacing is needed.
+    static func type(_ text: String, paceMilliseconds: Int? = nil) {
         guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
 
         let allChunks = chunks(of: text)
-        let pause = chunkPause(forChunkCount: allChunks.count)
-        logInsertion(payload: text, chunks: allChunks.count, pause: pause)
+        let requested = paceMilliseconds.map(microseconds(fromMilliseconds:)) ?? chunkPauseMicroseconds
+        let pause = chunkPause(forChunkCount: allChunks.count, requested: requested)
 
         for (index, chunk) in allChunks.enumerated() {
             guard
